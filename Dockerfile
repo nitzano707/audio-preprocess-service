@@ -14,7 +14,6 @@ ENV BASE_URL=https://audio-preprocess-service.onrender.com
 ENV MAX_MB=25
 ENV AUTO_DELETE_AFTER_SEC=3600
 
-# 🔧 פתרון Render קלאסי
 ENV PORT=8000
 EXPOSE 8000
 CMD uvicorn app:app --host 0.0.0.0 --port $PORT
