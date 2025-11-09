@@ -10,7 +10,7 @@ MAX_MB = int(os.environ.get("MAX_MB", "25"))
 AUTO_DELETE_AFTER_SEC = int(os.environ.get("AUTO_DELETE_AFTER_SEC", "3600"))
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-app = FastAPI(title="Universal Audio Preprocess Service")
+app = FastAPI(title="Universal Audio Processor")
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,25 +36,27 @@ def delete_later(paths, delay=AUTO_DELETE_AFTER_SEC):
         print(f"[Auto Delete] cleaned {len(paths)} items")
     threading.Thread(target=_worker, daemon=True).start()
 
+
 def public_url_for(path: str) -> str:
     rel = os.path.relpath(path, start=UPLOAD_DIR).replace("\\", "/")
     return f"{BASE_URL}/files/{rel}"
 
-# ───────────────────────────────────────────────
+
 def run_ffmpeg(cmd, timeout=60):
-    """הרצה בטוחה של ffmpeg עם טיפול בשגיאות"""
+    """הרצה בטוחה של ffmpeg"""
     print("[CMD]", " ".join(cmd))
     subprocess.run(cmd, check=True, timeout=timeout)
+
 
 def convert_to_wav(in_path: str, out_path: str):
     """המרה לכל קובץ WAV תקני"""
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
         "-i", in_path,
-        "-ar", "16000", "-ac", "1",
-        "-vn", out_path
+        "-ar", "16000", "-ac", "1", "-vn", out_path
     ]
     run_ffmpeg(cmd, timeout=60)
+
 
 def split_audio(in_path: str, out_dir: str, segment_seconds: int = 300):
     """פיצול לפי זמן – תומך בכל פורמט"""
@@ -72,16 +74,6 @@ def split_audio(in_path: str, out_dir: str, segment_seconds: int = 300):
     run_ffmpeg(cmd, timeout=90)
     return [os.path.join(out_dir, f) for f in sorted(os.listdir(out_dir)) if f.endswith(".wav")]
 
-def compress_to_ogg(in_path: str, out_path: str):
-    """דחיסה מהירה ל-OGG Opus"""
-    cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-i", in_path,
-        "-ac", "1", "-ar", "16000",
-        "-b:a", "32k", "-c:a", "libopus",
-        out_path
-    ]
-    run_ffmpeg(cmd, timeout=25)
 
 def merge_ogg_files(file_list, output_path):
     """מיזוג קבצי OGG לקובץ אחד"""
@@ -99,10 +91,60 @@ def merge_ogg_files(file_list, output_path):
     run_ffmpeg(cmd, timeout=60)
     os.remove(list_path)
 
+
+def compress_to_ogg(in_path: str, out_path: str):
+    """דחיסה חכמה – מתאימה איכות וזמן לפי גודל הקובץ"""
+    size_mb = os.path.getsize(in_path) / (1024 * 1024)
+
+    # קביעת איכות דינמית
+    if size_mb < 10:
+        bitrate = "48k"
+    elif size_mb < 30:
+        bitrate = "32k"
+    else:
+        bitrate = "24k"  # לקבצים כבדים במיוחד
+
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-i", in_path,
+        "-ac", "1", "-ar", "16000",
+        "-b:a", bitrate, "-c:a", "libopus",
+        out_path
+    ]
+
+    try:
+        subprocess.run(cmd, check=True, timeout=40)
+    except subprocess.TimeoutExpired:
+        print(f"[WARN] Compress timed out on {size_mb:.1f} MB, splitting...")
+        tmp1 = out_path + ".part1.ogg"
+        tmp2 = out_path + ".part2.ogg"
+
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", in_path],
+            capture_output=True, text=True
+        )
+        duration = float(probe.stdout.strip() or 0)
+        mid = duration / 2
+
+        subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                        "-i", in_path, "-t", str(mid),
+                        "-ac", "1", "-ar", "16000", "-b:a", bitrate, "-c:a", "libopus", tmp1],
+                       check=True, timeout=40)
+        subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                        "-i", in_path, "-ss", str(mid),
+                        "-ac", "1", "-ar", "16000", "-b:a", bitrate, "-c:a", "libopus", tmp2],
+                       check=True, timeout=40)
+
+        merge_ogg_files([tmp1, tmp2], out_path)
+        os.remove(tmp1)
+        os.remove(tmp2)
+
 # ───────────────────────────────────────────────
 @app.get("/health")
 def health():
     return {"ok": True, "message": "Universal audio processor ready"}
+
 
 @app.get("/files/{subpath:path}")
 def serve_file(subpath: str):
@@ -111,7 +153,7 @@ def serve_file(subpath: str):
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(full, media_type="audio/ogg")
 
-# ───────────────────────────────────────────────
+
 @app.post("/process")
 async def process_audio(file: UploadFile = File(...), max_mb: int = MAX_MB):
     start = time.time()
@@ -124,20 +166,18 @@ async def process_audio(file: UploadFile = File(...), max_mb: int = MAX_MB):
         shutil.copyfileobj(file.file, f)
 
     try:
-        # שלב 1: המרה לכל קובץ WAV
+        # שלב 1: המרה ל-WAV תקני
         wav_path = os.path.join(work_dir, "converted.wav")
         convert_to_wav(in_path, wav_path)
 
-        # שלב 2: בדיקת גודל
         size_mb = os.path.getsize(wav_path) / (1024 * 1024)
         print(f"[INFO] normalized WAV size = {size_mb:.2f} MB")
 
-        # שלב 3: אם גדול מדי → פיצול
+        # שלב 2: פיצול ודחיסה
         if size_mb > max_mb:
             parts_dir = os.path.join(work_dir, "parts")
             parts = split_audio(wav_path, parts_dir, segment_seconds=300)
             ogg_parts = []
-
             for p in parts:
                 out_p = p.replace(".wav", ".ogg")
                 compress_to_ogg(p, out_p)
@@ -155,10 +195,11 @@ async def process_audio(file: UploadFile = File(...), max_mb: int = MAX_MB):
                 "processing_time_sec": round(time.time() - start, 2)
             }
 
-        # שלב 4: אם קטן → דחיסה רגילה בלבד
+        # שלב 3: דחיסה רגילה
         out_path = os.path.join(work_dir, "compressed.ogg")
         compress_to_ogg(wav_path, out_path)
         delete_later([work_dir])
+
         return {
             "ok": True,
             "mode": "compressed",
