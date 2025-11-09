@@ -1,4 +1,4 @@
-import os, shutil, subprocess, uuid, threading, time, math
+import os, shutil, subprocess, uuid, threading, time
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -9,7 +9,7 @@ MAX_MB = int(os.environ.get("MAX_MB", "25"))
 AUTO_DELETE_AFTER_SEC = int(os.environ.get("AUTO_DELETE_AFTER_SEC", "3600"))
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-app = FastAPI(title="Ultra-Fast Audio Split & Compress")
+app = FastAPI(title="Ultra-Fast Audio Split & Compress (Time-Based)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,7 +19,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ───────────────────────────────
 def delete_later(paths, delay=AUTO_DELETE_AFTER_SEC):
     def _worker():
         time.sleep(delay)
@@ -38,7 +37,6 @@ def public_url_for(path: str) -> str:
     rel = os.path.relpath(path, start=UPLOAD_DIR).replace("\\", "/")
     return f"{BASE_URL}/files/{rel}"
 
-# ───────────────────────────────
 def fast_compress(in_path: str, out_path: str):
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
@@ -49,24 +47,24 @@ def fast_compress(in_path: str, out_path: str):
     ]
     subprocess.run(cmd, check=True, timeout=20)
 
-def fast_split(in_path: str, out_dir: str, target_size_mb: int = 20):
-    """פיצול לפי משקל בלבד – בלי ffprobe, מהיר במיוחד"""
+def ffmpeg_split_by_time(in_path: str, out_dir: str, segment_seconds: int = 300):
+    """פיצול לפי זמן – כל קטע 5 דקות (או פחות)."""
     os.makedirs(out_dir, exist_ok=True)
-    chunk_size = target_size_mb * 1024 * 1024
-    with open(in_path, "rb") as f:
-        i, chunk = 0, f.read(chunk_size)
-        while chunk:
-            part_path = os.path.join(out_dir, f"part_{i:03d}.mp3")
-            with open(part_path, "wb") as out:
-                out.write(chunk)
-            i += 1
-            chunk = f.read(chunk_size)
-    return [os.path.join(out_dir, f) for f in sorted(os.listdir(out_dir))]
+    pattern = os.path.join(out_dir, "part_%03d.mp3")
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-i", in_path,
+        "-f", "segment",
+        "-segment_time", str(segment_seconds),
+        "-c", "copy",
+        pattern
+    ]
+    subprocess.run(cmd, check=True, timeout=60)
+    return [os.path.join(out_dir, f) for f in sorted(os.listdir(out_dir)) if f.endswith(".mp3")]
 
-# ───────────────────────────────
 @app.get("/health")
 def health():
-    return {"ok": True, "message": "Service running ultra-fast"}
+    return {"ok": True, "message": "Service running time-based split"}
 
 @app.get("/files/{subpath:path}")
 def serve_file(subpath: str):
@@ -75,7 +73,6 @@ def serve_file(subpath: str):
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(full, media_type="audio/ogg")
 
-# ───────────────────────────────
 @app.post("/process")
 async def process_audio(file: UploadFile = File(...), max_mb: int = MAX_MB):
     start = time.time()
@@ -91,7 +88,6 @@ async def process_audio(file: UploadFile = File(...), max_mb: int = MAX_MB):
         size_mb = os.path.getsize(in_path) / (1024 * 1024)
         print(f"[INFO] File size: {size_mb:.2f} MB")
 
-        # אם קטן מ-25MB → דחיסה רגילה
         if size_mb <= max_mb:
             out_path = os.path.join(work_dir, "compressed.ogg")
             fast_compress(in_path, out_path)
@@ -104,9 +100,9 @@ async def process_audio(file: UploadFile = File(...), max_mb: int = MAX_MB):
                 "processing_time_sec": round(time.time() - start, 2)
             }
 
-        # אם גדול מדי → פיצול למקטעים ודחיסה לכל חלק
+        # פיצול לפי זמן – מקטעים של עד 5 דקות
         parts_dir = os.path.join(work_dir, "parts")
-        parts = fast_split(in_path, parts_dir, target_size_mb=20)
+        parts = ffmpeg_split_by_time(in_path, parts_dir, segment_seconds=300)
         urls = []
 
         for p in parts:
@@ -115,7 +111,7 @@ async def process_audio(file: UploadFile = File(...), max_mb: int = MAX_MB):
                 fast_compress(p, out_p)
                 urls.append(public_url_for(out_p))
             except Exception:
-                urls.append(public_url_for(p))  # fallback
+                urls.append(public_url_for(p))  # fallback MP3 אם נכשל
 
         delete_later([work_dir])
         return {
