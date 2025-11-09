@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: audio-preprocess-service
+    env: docker
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: BASE_URL
+        value: https://audio-preprocess-service.onrender.com
+      - key: MAX_MB
+        value: "25"
+      - key: AUTO_DELETE_AFTER_SEC
+        value: "3600"
